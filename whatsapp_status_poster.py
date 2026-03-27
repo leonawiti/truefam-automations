@@ -187,130 +187,112 @@ def wait_for_whatsapp_load(driver, timeout=60):
     print("  [WhatsApp] Waiting for WhatsApp Web to load...")
     driver.get("https://web.whatsapp.com/")
 
-    # Wait for either the main app or QR code to appear
+    # Wait for either the main app icons or QR code to appear
     WebDriverWait(driver, timeout).until(
-        lambda d: d.find_elements(By.CSS_SELECTOR, '[data-icon="status-v3-outline"]')
-        or d.find_elements(By.CSS_SELECTOR, 'canvas[aria-label="Scan this QR code to link a device!"]')
-        or d.find_elements(By.CSS_SELECTOR, '[data-testid="qrcode"]')
+        lambda d: d.find_elements(By.CSS_SELECTOR, '[data-icon="status-refreshed"]')
+        or d.find_elements(By.CSS_SELECTOR, '[data-icon="chat-filled-refreshed"]')
+        or d.find_elements(By.CSS_SELECTOR, 'canvas[aria-label*="QR"]')
+        or d.find_elements(By.CSS_SELECTOR, '[data-ref]')
     )
 
     # Check if QR code is showing (not logged in)
     qr_elements = driver.find_elements(By.CSS_SELECTOR, 'canvas[aria-label*="QR"]') + \
-                   driver.find_elements(By.CSS_SELECTOR, '[data-testid="qrcode"]')
+                   driver.find_elements(By.CSS_SELECTOR, '[data-ref]')
 
-    if qr_elements:
+    if qr_elements and not driver.find_elements(By.CSS_SELECTOR, '[data-icon="status-refreshed"]'):
         print("\n  ╔══════════════════════════════════════════════════╗")
         print("  ║  SCAN THE QR CODE on your phone to log in.      ║")
         print("  ║  Waiting up to 120 seconds...                    ║")
         print("  ╚══════════════════════════════════════════════════╝\n")
 
-        # Wait for successful login (status icon appears)
         WebDriverWait(driver, 120).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-icon="status-v3-outline"]'))
+            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-icon="status-refreshed"]'))
         )
 
     print("  [WhatsApp] Logged in successfully")
-    time.sleep(2)
+    time.sleep(3)
 
 
 def post_status(driver, image_path: str, caption: str):
     """Post an image + caption as WhatsApp Status."""
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    # Step 1: Click on Status tab
+    # Step 1: Click on Status tab (icon: status-refreshed)
     print("  [WhatsApp] Navigating to Status tab...")
     status_btn = WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-icon="status-v3-outline"]'))
+        EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-icon="status-refreshed"]'))
     )
     status_btn.click()
-    time.sleep(2)
+    time.sleep(3)
 
-    # Step 2: Click the "+" / pencil / camera icon to create a new status
-    # WhatsApp Web shows a FAB or "My status" area
-    print("  [WhatsApp] Looking for new status button...")
-
-    # Try multiple selectors for the "add status" action
-    add_selectors = [
-        '[data-icon="plus"]',
-        '[data-icon="pencil-new"]',
-        '[data-testid="status-v3-add"]',
-        'span[data-icon="photo"]',
-        '[aria-label="Add status"]',
-        '[title="My status"]',
-    ]
-
-    add_btn = None
-    for selector in add_selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        if elements:
-            add_btn = elements[0]
-            break
-
-    if not add_btn:
-        # Try clicking "My status" text area
-        my_status = driver.find_elements(By.XPATH, "//*[contains(text(), 'My status')]")
-        if my_status:
-            add_btn = my_status[0]
-
-    if not add_btn:
-        raise RuntimeError("Could not find 'Add status' button. WhatsApp Web UI may have changed.")
-
+    # Step 2: Click "Add Status" button
+    print("  [WhatsApp] Clicking Add Status...")
+    add_btn = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, '[aria-label="Add Status"]'))
+    )
     add_btn.click()
-    time.sleep(2)
+    time.sleep(3)
 
-    # Step 3: Look for photo/image option and upload
+    # Step 3: Click "Photos & videos" option
+    print("  [WhatsApp] Selecting Photos & videos...")
+    photos_btn = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, '[aria-label="Photos & videos"]'))
+    )
+    photos_btn.click()
+    time.sleep(3)
+
+    # Step 4: Upload image via file input (the image-specific one)
     print("  [WhatsApp] Uploading image...")
-
-    # Find file input element (hidden input for file upload)
-    file_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"][accept*="image"]')
+    file_inputs = driver.find_elements(
+        By.CSS_SELECTOR, 'input[type="file"][accept*="image"]'
+    )
     if not file_inputs:
         file_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
 
     if not file_inputs:
-        raise RuntimeError("Could not find file upload input. WhatsApp Web UI may have changed.")
+        raise RuntimeError("Could not find file upload input.")
 
-    file_input = file_inputs[0]
-    file_input.send_keys(os.path.abspath(image_path))
-    time.sleep(3)
+    file_inputs[0].send_keys(os.path.abspath(image_path))
+    print("  [WhatsApp] Image uploaded, waiting for editor...")
+    time.sleep(5)
 
-    # Step 4: Add caption
+    # Step 5: Add caption in the "Add a caption" field
     print("  [WhatsApp] Adding caption...")
-    caption_selectors = [
-        '[data-testid="media-caption-input-container"] [contenteditable="true"]',
-        'div[contenteditable="true"][data-tab]',
-        '.copyable-text[contenteditable="true"]',
-        '[data-testid="status-text-input"] [contenteditable="true"]',
-    ]
-
     caption_box = None
-    for selector in caption_selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        if elements:
-            caption_box = elements[-1]  # Usually the last one is the caption field
-            break
+
+    # Try the specific "Add a caption" label first
+    caption_elements = driver.find_elements(
+        By.CSS_SELECTOR, '[aria-label="Add a caption"]'
+    )
+    if caption_elements:
+        caption_box = caption_elements[0]
+    else:
+        # Fallback to contenteditable textbox
+        editable = driver.find_elements(
+            By.CSS_SELECTOR, 'div[contenteditable="true"][role="textbox"]'
+        )
+        if editable:
+            caption_box = editable[0]
 
     if caption_box:
         caption_box.click()
         time.sleep(0.5)
-        # Type caption using keyboard to handle special characters
         caption_box.send_keys(caption)
         time.sleep(1)
+        print("  [WhatsApp] Caption added")
     else:
         print("  [WhatsApp] Warning: Could not find caption input, posting without caption")
 
-    # Step 5: Click Send
+    # Step 6: Click Send (icon: wds-ic-send-filled)
     print("  [WhatsApp] Sending status...")
-    send_selectors = [
-        '[data-icon="send"]',
-        '[data-testid="send"]',
-        '[aria-label="Send"]',
-        'span[data-icon="send"]',
-    ]
-
     send_btn = None
+    send_selectors = [
+        '[data-icon="wds-ic-send-filled"]',
+        '[aria-label="Send"]',
+        '[data-icon="send"]',
+    ]
     for selector in send_selectors:
         elements = driver.find_elements(By.CSS_SELECTOR, selector)
         if elements:
@@ -321,7 +303,7 @@ def post_status(driver, image_path: str, caption: str):
         raise RuntimeError("Could not find Send button. WhatsApp Web UI may have changed.")
 
     send_btn.click()
-    time.sleep(3)
+    time.sleep(5)
 
     print("  [WhatsApp] Status posted successfully!")
 
