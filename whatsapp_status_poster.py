@@ -42,7 +42,8 @@ CHROME_PROFILE = os.getenv(
 COL_CAPTION = 0    # A
 COL_IMAGE = 1      # B (unused)
 COL_IMAGE_URL = 2  # C
-COL_SENT = 3       # D
+COL_SENT = 3       # D (legacy — no longer used for WhatsApp)
+COL_WHATSAPP = 7   # H — WhatsApp posting status
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,7 +66,7 @@ def get_sheet():
 
 
 def find_next_unsent(sheet) -> dict | None:
-    """Return the first row where the Sent column is blank."""
+    """Return the first row where column H (WhatsApp) is blank."""
     rows = sheet.get_all_values()
     if not rows:
         return None
@@ -73,11 +74,11 @@ def find_next_unsent(sheet) -> dict | None:
     # Skip header row
     for i, row in enumerate(rows[1:], start=2):  # row 2 in sheet (1-indexed)
         # Pad row to ensure we have enough columns
-        while len(row) < 4:
+        while len(row) < COL_WHATSAPP + 1:
             row.append("")
 
-        sent = row[COL_SENT].strip().lower()
-        if sent not in ("yes", "y", "true", "1"):
+        whatsapp_status = row[COL_WHATSAPP].strip().lower()
+        if whatsapp_status not in ("yes", "y", "true", "1"):
             caption = row[COL_CAPTION].strip()
             image_url = row[COL_IMAGE_URL].strip()
             if caption and image_url:
@@ -90,9 +91,9 @@ def find_next_unsent(sheet) -> dict | None:
 
 
 def mark_as_sent(sheet, row_number: int):
-    """Update the Sent column to 'Yes' for the given row."""
-    sheet.update_cell(row_number, COL_SENT + 1, "Yes")  # gspread is 1-indexed
-    print(f"  [Sheet] Row {row_number} marked as Sent=Yes")
+    """Update column H (WhatsApp) to 'Yes' for the given row."""
+    sheet.update_cell(row_number, COL_WHATSAPP + 1, "Yes")  # gspread is 1-indexed
+    print(f"  [Sheet] Row {row_number} column H (WhatsApp) marked as Yes")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
