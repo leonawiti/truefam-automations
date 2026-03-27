@@ -1,0 +1,6 @@
+.env
+chrome_profile/
+__pycache__/
+*.pyc
+*.json
+!.env.example
