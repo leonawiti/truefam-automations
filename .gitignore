@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.json
 !.env.example
+posted_shorts.json
