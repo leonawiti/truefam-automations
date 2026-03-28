@@ -50,8 +50,8 @@ COL_WHATSAPP = 7   # H — WhatsApp posting status
 # Google Sheets helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_sheet():
-    """Authenticate and return the first worksheet of the content sheet."""
+def get_spreadsheet():
+    """Authenticate and return the spreadsheet object."""
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -61,8 +61,14 @@ def get_sheet():
     ]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(SHEET_ID)
-    return spreadsheet.sheet1
+    return gc.open_by_key(SHEET_ID)
+
+
+def get_all_sheets():
+    """Return a list of (sheet_name, worksheet) for all sheets in the spreadsheet."""
+    spreadsheet = get_spreadsheet()
+    worksheets = spreadsheet.worksheets()
+    return [(ws.title, ws) for ws in worksheets]
 
 
 def find_next_unsent(sheet) -> dict | None:
@@ -115,40 +121,45 @@ def extract_drive_file_id(url_or_id: str) -> str:
 
 
 def download_image(url_or_id: str, dest_dir: str) -> str:
-    """Download image from Google Drive and return local file path."""
-    import requests
+    """Download image from Google Drive using service account auth."""
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    import io
 
     file_id = extract_drive_file_id(url_or_id)
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
     print(f"  [Drive] Downloading file ID: {file_id}")
 
-    session = requests.Session()
-    resp = session.get(download_url, stream=True, allow_redirects=True)
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_FILE,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    service = build("drive", "v3", credentials=creds)
 
-    # Handle Google Drive virus scan warning for large files
-    for key, value in resp.cookies.items():
-        if key.startswith("download_warning"):
-            download_url = f"{download_url}&confirm={value}"
-            resp = session.get(download_url, stream=True, allow_redirects=True)
-            break
+    # Get file metadata to determine mime type
+    meta = service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    mime = meta.get("mimeType", "image/jpeg")
+    name = meta.get("name", "image")
+    print(f"  [Drive] File: {name} ({mime})")
 
-    resp.raise_for_status()
-
-    # Determine extension from content-type
-    content_type = resp.headers.get("Content-Type", "image/jpeg")
     ext = ".jpg"
-    if "png" in content_type:
+    if "png" in mime:
         ext = ".png"
-    elif "webp" in content_type:
+    elif "webp" in mime:
         ext = ".webp"
-    elif "gif" in content_type:
+    elif "gif" in mime:
         ext = ".gif"
 
+    # Download file content
+    request = service.files().get_media(fileId=file_id)
+    os.makedirs(dest_dir, exist_ok=True)
     filepath = os.path.join(dest_dir, f"status_image{ext}")
+
     with open(filepath, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+        downloader = MediaIoBaseDownload(io.FileIO(filepath, "wb"), request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
 
     size_kb = os.path.getsize(filepath) / 1024
     print(f"  [Drive] Downloaded: {filepath} ({size_kb:.0f} KB)")
@@ -220,11 +231,27 @@ def post_status(driver, image_path: str, caption: str):
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    # Step 1: Click on Status tab (icon: status-refreshed)
+    # Step 0: Navigate back to chats first (reset state from any previous post)
+    chat_btns = driver.find_elements(By.CSS_SELECTOR, '[data-icon="chat-refreshed"]')
+    if not chat_btns:
+        chat_btns = driver.find_elements(By.CSS_SELECTOR, '[data-icon="chat-filled-refreshed"]')
+    if chat_btns:
+        chat_btns[0].click()
+        time.sleep(2)
+
+    # Step 1: Click on Status tab (icon varies based on active/inactive state)
     print("  [WhatsApp] Navigating to Status tab...")
-    status_btn = WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-icon="status-refreshed"]'))
-    )
+    status_btn = None
+    for icon in ["status-refreshed", "status-filled-refreshed"]:
+        elements = driver.find_elements(By.CSS_SELECTOR, f'[data-icon="{icon}"]')
+        if elements:
+            status_btn = elements[0]
+            break
+    if not status_btn:
+        # Fallback: try the Status button by aria-label
+        status_btn = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Status"]'))
+        )
     status_btn.click()
     time.sleep(3)
 
@@ -257,25 +284,29 @@ def post_status(driver, image_path: str, caption: str):
 
     file_inputs[0].send_keys(os.path.abspath(image_path))
     print("  [WhatsApp] Image uploaded, waiting for editor...")
-    time.sleep(5)
+    time.sleep(8)
 
     # Step 5: Add caption in the "Add a caption" field
     print("  [WhatsApp] Adding caption...")
     caption_box = None
 
-    # Try the specific "Add a caption" label first
-    caption_elements = driver.find_elements(
-        By.CSS_SELECTOR, '[aria-label="Add a caption"]'
-    )
-    if caption_elements:
-        caption_box = caption_elements[0]
-    else:
-        # Fallback to contenteditable textbox
+    # Try multiple approaches with retries
+    for attempt in range(3):
+        caption_elements = driver.find_elements(
+            By.CSS_SELECTOR, '[aria-label="Add a caption"]'
+        )
+        if caption_elements:
+            caption_box = caption_elements[0]
+            break
+
         editable = driver.find_elements(
             By.CSS_SELECTOR, 'div[contenteditable="true"][role="textbox"]'
         )
         if editable:
-            caption_box = editable[0]
+            caption_box = editable[-1]
+            break
+
+        time.sleep(2)
 
     if caption_box:
         caption_box.click()
@@ -286,7 +317,7 @@ def post_status(driver, image_path: str, caption: str):
     else:
         print("  [WhatsApp] Warning: Could not find caption input, posting without caption")
 
-    # Step 6: Click Send (icon: wds-ic-send-filled)
+    # Step 6: Click Send — try multiple selectors with retries
     print("  [WhatsApp] Sending status...")
     send_btn = None
     send_selectors = [
@@ -294,17 +325,31 @@ def post_status(driver, image_path: str, caption: str):
         '[aria-label="Send"]',
         '[data-icon="send"]',
     ]
-    for selector in send_selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        if elements:
-            send_btn = elements[0]
+
+    for attempt in range(3):
+        for selector in send_selectors:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            if elements:
+                send_btn = elements[0]
+                break
+        if send_btn:
             break
+        # Also scan all icons for anything with "send"
+        all_icons = driver.find_elements(By.CSS_SELECTOR, '[data-icon]')
+        for el in all_icons:
+            icon_name = el.get_attribute('data-icon') or ''
+            if 'send' in icon_name.lower():
+                send_btn = el
+                break
+        if send_btn:
+            break
+        time.sleep(2)
 
     if not send_btn:
         raise RuntimeError("Could not find Send button. WhatsApp Web UI may have changed.")
 
     send_btn.click()
-    time.sleep(5)
+    time.sleep(6)
 
     print("  [WhatsApp] Status posted successfully!")
 
@@ -335,55 +380,120 @@ def main():
             driver.quit()
         return
 
-    # ── Read sheet ──
-    print("\n[1/5] Reading Google Sheet...")
-    sheet = get_sheet()
-    post = find_next_unsent(sheet)
+    # ── Read all sheets and find one unsent post per sheet ──
+    print("\n[1/6] Reading Google Sheets...")
+    sheets = get_all_sheets()
+    print(f"  Found {len(sheets)} sheet(s): {', '.join(name for name, _ in sheets)}")
 
-    if not post:
-        print("  No unsent posts found. All rows have been posted.")
+    posts_to_send = []
+    for sheet_name, worksheet in sheets:
+        post = find_next_unsent(worksheet)
+        if post:
+            post["sheet_name"] = sheet_name
+            post["worksheet"] = worksheet
+            posts_to_send.append(post)
+            print(f"\n  [{sheet_name}] Row {post['row_number']}:")
+            print(f"    Caption: {post['caption'][:70]}{'...' if len(post['caption']) > 70 else ''}")
+            print(f"    Image:   {post['image_url'][:55]}...")
+        else:
+            print(f"\n  [{sheet_name}] No unsent posts — all done")
+
+    if not posts_to_send:
+        print("\n  No unsent posts in any sheet. All caught up!")
         return
 
-    print(f"  Found unsent post at row {post['row_number']}:")
-    print(f"  Caption: {post['caption'][:80]}{'...' if len(post['caption']) > 80 else ''}")
-    print(f"  Image:   {post['image_url'][:60]}...")
+    print(f"\n  Total posts to send this run: {len(posts_to_send)}")
 
     # ── Dry run ──
     if args.dry:
         print("\n[Dry run] Would post the above. Exiting without sending.")
         return
 
-    # ── Download image ──
-    print("\n[2/5] Downloading image from Google Drive...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        image_path = download_image(post["image_url"], tmpdir)
-
-        # ── Launch browser ──
-        print("\n[3/5] Launching WhatsApp Web...")
-        driver = get_driver()
-
+    # ── Download all images first (skip posts with bad images) ──
+    print("\n[2/6] Downloading images from Google Drive...")
+    tmpdir = tempfile.mkdtemp()
+    valid_posts = []
+    for i, post in enumerate(posts_to_send):
         try:
-            wait_for_whatsapp_load(driver)
-
-            # ── Post status ──
-            print("\n[4/5] Posting status update...")
-            post_status(driver, image_path, post["caption"])
-
-            # ── Mark as sent ──
-            print("\n[5/5] Updating Google Sheet...")
-            mark_as_sent(sheet, post["row_number"])
-
-            print("\n" + "=" * 56)
-            print("  Done! Status posted and sheet updated.")
-            print("=" * 56)
-
+            img_path = download_image(post["image_url"], tmpdir + f"/{i}")
+            post["image_path"] = img_path
+            valid_posts.append(post)
         except Exception as e:
-            print(f"\n  ERROR: {e}")
-            print("  Status was NOT posted. Sheet was NOT updated.")
-            raise
-        finally:
-            time.sleep(2)
-            driver.quit()
+            print(f"  [Skip] [{post['sheet_name']}] Row {post['row_number']}: {e}")
+            # Try finding the next valid unsent row from this sheet
+            sheet_name = post["sheet_name"]
+            worksheet = post["worksheet"]
+            rows = worksheet.get_all_values()
+            found_replacement = False
+            for ri, row in enumerate(rows[post["row_number"]:], start=post["row_number"] + 1):
+                while len(row) < COL_WHATSAPP + 1:
+                    row.append("")
+                if row[COL_WHATSAPP].strip().lower() not in ("yes", "y", "true", "1"):
+                    caption = row[COL_CAPTION].strip()
+                    image_url = row[COL_IMAGE_URL].strip()
+                    if caption and image_url:
+                        try:
+                            img_path = download_image(image_url, tmpdir + f"/{i}")
+                            replacement = {
+                                "row_number": ri,
+                                "caption": caption,
+                                "image_url": image_url,
+                                "sheet_name": sheet_name,
+                                "worksheet": worksheet,
+                                "image_path": img_path,
+                            }
+                            valid_posts.append(replacement)
+                            print(f"  [Retry] [{sheet_name}] Using row {ri} instead")
+                            found_replacement = True
+                            break
+                        except Exception:
+                            continue
+            if not found_replacement:
+                print(f"  [Skip] [{sheet_name}] No valid images found, skipping this sheet")
+    posts_to_send = valid_posts
+
+    if not posts_to_send:
+        print("\n  No valid posts to send after downloading images.")
+        return
+
+    # ── Launch browser once ──
+    print("\n[3/6] Launching WhatsApp Web...")
+    driver = get_driver()
+
+    try:
+        wait_for_whatsapp_load(driver)
+
+        # ── Post each status ──
+        for i, post in enumerate(posts_to_send, 1):
+            print(f"\n[4/6] Posting status {i}/{len(posts_to_send)} [{post['sheet_name']}]...")
+            post_status(driver, post["image_path"], post["caption"])
+
+            # Wait between posts to avoid issues
+            if i < len(posts_to_send):
+                print("  Waiting 5 seconds before next post...")
+                time.sleep(5)
+
+        # ── Mark all as sent ──
+        print(f"\n[5/6] Updating Google Sheets...")
+        for post in posts_to_send:
+            mark_as_sent(post["worksheet"], post["row_number"])
+            print(f"  [{post['sheet_name']}] Row {post['row_number']} ✓")
+
+        print("\n" + "=" * 56)
+        print(f"  Done! {len(posts_to_send)} status(es) posted and sheets updated.")
+        print("=" * 56)
+
+    except Exception as e:
+        print(f"\n  ERROR: {e}")
+        print("  Some posts may not have been sent. Check sheets manually.")
+        raise
+    finally:
+        time.sleep(2)
+        driver.quit()
+
+    # Clean up temp dir
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
