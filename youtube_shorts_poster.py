@@ -67,42 +67,55 @@ def save_to_history(video_id: str, title: str):
 # YouTube search & download
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _query_to_hashtag_url(query: str) -> str:
+    """Convert a search query to a YouTube hashtag Shorts URL."""
+    # "coding memes shorts" -> "codingmemes"
+    tag = query.lower().replace("shorts", "").replace(" ", "").strip()
+    return f"https://www.youtube.com/hashtag/{tag}/shorts"
+
+
 def search_shorts(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
     """Search YouTube for Shorts and return metadata list."""
     import yt_dlp
 
-    search_url = f"ytsearch{max_results}:{query}"
-    print(f"  [YouTube] Searching: {query} (top {max_results} results)")
+    hashtag_url = _query_to_hashtag_url(query)
+    print(f"  [YouTube] Searching: {hashtag_url}")
 
+    # First pass: get list of Shorts URLs via flat extraction (fast)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": False,
+        "extract_flat": True,
         "skip_download": True,
+        "playlistend": max_results,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(search_url, download=False)
+        result = ydl.extract_info(hashtag_url, download=False)
 
     entries = result.get("entries", [])
+
     shorts = []
     for entry in entries:
         if not entry:
             continue
-        duration = entry.get("duration", 999)
         video_id = entry.get("id", "")
-        title = entry.get("title", "Unknown")
-        url = entry.get("webpage_url") or f"https://www.youtube.com/shorts/{video_id}"
+        title = entry.get("title") or "Untitled"
+        url = entry.get("url") or f"https://www.youtube.com/shorts/{video_id}"
 
-        if duration and duration <= MAX_DURATION:
+        # Only include actual Shorts URLs
+        if "/shorts/" in url or entry.get("duration", 0) <= MAX_DURATION:
             shorts.append({
                 "id": video_id,
                 "title": title,
-                "duration": duration,
+                "duration": entry.get("duration", 0),
                 "url": url,
             })
 
-    print(f"  [YouTube] Found {len(shorts)} Shorts (≤{MAX_DURATION}s) out of {len(entries)} results")
+        if len(shorts) >= max_results:
+            break
+
+    print(f"  [YouTube] Found {len(shorts)} Shorts from {len(entries)} results")
     return shorts
 
 
