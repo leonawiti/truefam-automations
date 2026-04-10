@@ -1,0 +1,35 @@
+name: Website Health Check
+
+on:
+  schedule:
+    # 8:00 AM Central = 13:00 UTC (CDT, Apr–Oct) or 14:00 UTC (CST, Nov–Mar)
+    # Run at both times so it always fires at ~8 AM Central year-round
+    - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website-health-monitor
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run health check and send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          HEALTH_REPORT_RECIPIENT: ${{ secrets.HEALTH_REPORT_RECIPIENT }}
+        run: python health_check.py

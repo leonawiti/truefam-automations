@@ -1,0 +1,7 @@
+.env
+linkedin_chrome_profile/
+logs/
+state.json
+__pycache__/
+*.pyc
+.venv/

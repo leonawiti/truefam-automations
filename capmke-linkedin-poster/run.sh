@@ -1,0 +1,15 @@
+#!/bin/bash
+# Wrapper script invoked by launchd. Activates a Python venv and runs the
+# poster. Prefers a per-folder .venv, falls back to the shared one at the
+# repo root.
+set -e
+
+cd "$(dirname "$0")"
+
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -d "../../.venv" ]; then
+    source ../../.venv/bin/activate
+fi
+
+python post_to_linkedin.py "$@"

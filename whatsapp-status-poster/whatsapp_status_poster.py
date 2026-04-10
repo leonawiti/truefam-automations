@@ -38,12 +38,30 @@ CHROME_PROFILE = os.getenv(
     str(Path(__file__).resolve().parent / "chrome_profile"),
 )
 
-# Column indices (0-based)
+# Default column indices (0-based) — used as fallback if headers aren't found
 COL_CAPTION = 0    # A
 COL_IMAGE = 1      # B (unused)
 COL_IMAGE_URL = 2  # C
 COL_SENT = 3       # D (legacy — no longer used for WhatsApp)
 COL_WHATSAPP = 7   # H — WhatsApp posting status
+
+
+def detect_columns(header_row: list[str]) -> dict:
+    """Detect column indices from the header row, case-insensitive."""
+    result = {
+        "caption": COL_CAPTION,
+        "image_url": COL_IMAGE_URL,
+        "whatsapp": COL_WHATSAPP,
+    }
+    for i, col in enumerate(header_row):
+        name = col.strip().lower()
+        if name == "caption":
+            result["caption"] = i
+        elif name == "image url":
+            result["image_url"] = i
+        elif name == "whatsapp":
+            result["whatsapp"] = i
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,34 +90,41 @@ def get_all_sheets():
 
 
 def find_next_unsent(sheet) -> dict | None:
-    """Return the first row where column H (WhatsApp) is blank."""
+    """Return the first row where the WhatsApp column is blank."""
     rows = sheet.get_all_values()
     if not rows:
         return None
 
+    cols = detect_columns(rows[0])
+    col_caption = cols["caption"]
+    col_image_url = cols["image_url"]
+    col_whatsapp = cols["whatsapp"]
+    max_col = max(col_caption, col_image_url, col_whatsapp)
+
     # Skip header row
     for i, row in enumerate(rows[1:], start=2):  # row 2 in sheet (1-indexed)
         # Pad row to ensure we have enough columns
-        while len(row) < COL_WHATSAPP + 1:
+        while len(row) < max_col + 1:
             row.append("")
 
-        whatsapp_status = row[COL_WHATSAPP].strip().lower()
+        whatsapp_status = row[col_whatsapp].strip().lower()
         if whatsapp_status not in ("yes", "y", "true", "1"):
-            caption = row[COL_CAPTION].strip()
-            image_url = row[COL_IMAGE_URL].strip()
+            caption = row[col_caption].strip()
+            image_url = row[col_image_url].strip()
             if caption and image_url:
                 return {
                     "row_number": i,
                     "caption": caption,
                     "image_url": image_url,
+                    "col_whatsapp": col_whatsapp,
                 }
     return None
 
 
-def mark_as_sent(sheet, row_number: int):
-    """Update column H (WhatsApp) to 'Yes' for the given row."""
-    sheet.update_cell(row_number, COL_WHATSAPP + 1, "Yes")  # gspread is 1-indexed
-    print(f"  [Sheet] Row {row_number} column H (WhatsApp) marked as Yes")
+def mark_as_sent(sheet, row_number: int, col_whatsapp: int = COL_WHATSAPP):
+    """Update the WhatsApp column to 'Yes' for the given row."""
+    sheet.update_cell(row_number, col_whatsapp + 1, "Yes")  # gspread is 1-indexed
+    print(f"  [Sheet] Row {row_number} column {chr(65 + col_whatsapp)} (WhatsApp) marked as Yes")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,11 +146,14 @@ def extract_drive_file_id(url_or_id: str) -> str:
 
 
 def download_image(url_or_id: str, dest_dir: str) -> str:
-    """Download image from Google Drive using service account auth."""
+    """Download image from Google Drive using service account auth.
+
+    Uses requests-based transport instead of httplib2 to avoid SSL
+    handshake hangs on macOS.
+    """
+    import requests as _requests
     from google.oauth2.service_account import Credentials
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
-    import io
+    from google.auth.transport.requests import AuthorizedSession
 
     file_id = extract_drive_file_id(url_or_id)
     print(f"  [Drive] Downloading file ID: {file_id}")
@@ -134,10 +162,16 @@ def download_image(url_or_id: str, dest_dir: str) -> str:
         CREDENTIALS_FILE,
         scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
-    service = build("drive", "v3", credentials=creds)
+    session = AuthorizedSession(creds)
 
     # Get file metadata to determine mime type
-    meta = service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    meta_resp = session.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        params={"fields": "name,mimeType"},
+        timeout=30,
+    )
+    meta_resp.raise_for_status()
+    meta = meta_resp.json()
     mime = meta.get("mimeType", "image/jpeg")
     name = meta.get("name", "image")
     print(f"  [Drive] File: {name} ({mime})")
@@ -151,15 +185,18 @@ def download_image(url_or_id: str, dest_dir: str) -> str:
         ext = ".gif"
 
     # Download file content
-    request = service.files().get_media(fileId=file_id)
+    dl_resp = session.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        params={"alt": "media"},
+        timeout=60,
+    )
+    dl_resp.raise_for_status()
+
     os.makedirs(dest_dir, exist_ok=True)
     filepath = os.path.join(dest_dir, f"status_image{ext}")
 
     with open(filepath, "wb") as f:
-        downloader = MediaIoBaseDownload(io.FileIO(filepath, "wb"), request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+        f.write(dl_resp.content)
 
     size_kb = os.path.getsize(filepath) / 1024
     print(f"  [Drive] Downloaded: {filepath} ({size_kb:.0f} KB)")
@@ -362,6 +399,7 @@ def main():
     parser = argparse.ArgumentParser(description="TRUEFAM WhatsApp Status Auto-Poster")
     parser.add_argument("--dry", action="store_true", help="Preview next post without sending")
     parser.add_argument("--login", action="store_true", help="Open WhatsApp Web to scan QR code")
+    parser.add_argument("--sheet", type=int, help="Only post from a specific sheet number (1-based)")
     args = parser.parse_args()
 
     print("=" * 56)
@@ -384,6 +422,13 @@ def main():
     print("\n[1/6] Reading Google Sheets...")
     sheets = get_all_sheets()
     print(f"  Found {len(sheets)} sheet(s): {', '.join(name for name, _ in sheets)}")
+
+    if args.sheet:
+        if args.sheet < 1 or args.sheet > len(sheets):
+            print(f"\n  ERROR: --sheet {args.sheet} is out of range (1-{len(sheets)})")
+            return
+        sheets = [sheets[args.sheet - 1]]
+        print(f"  Filtering to sheet {args.sheet}: {sheets[0][0]}")
 
     posts_to_send = []
     for sheet_name, worksheet in sheets:
@@ -424,13 +469,15 @@ def main():
             sheet_name = post["sheet_name"]
             worksheet = post["worksheet"]
             rows = worksheet.get_all_values()
+            cols = detect_columns(rows[0]) if rows else {"caption": COL_CAPTION, "image_url": COL_IMAGE_URL, "whatsapp": COL_WHATSAPP}
+            max_col = max(cols["caption"], cols["image_url"], cols["whatsapp"])
             found_replacement = False
             for ri, row in enumerate(rows[post["row_number"]:], start=post["row_number"] + 1):
-                while len(row) < COL_WHATSAPP + 1:
+                while len(row) < max_col + 1:
                     row.append("")
-                if row[COL_WHATSAPP].strip().lower() not in ("yes", "y", "true", "1"):
-                    caption = row[COL_CAPTION].strip()
-                    image_url = row[COL_IMAGE_URL].strip()
+                if row[cols["whatsapp"]].strip().lower() not in ("yes", "y", "true", "1"):
+                    caption = row[cols["caption"]].strip()
+                    image_url = row[cols["image_url"]].strip()
                     if caption and image_url:
                         try:
                             img_path = download_image(image_url, tmpdir + f"/{i}")
@@ -441,6 +488,7 @@ def main():
                                 "sheet_name": sheet_name,
                                 "worksheet": worksheet,
                                 "image_path": img_path,
+                                "col_whatsapp": cols["whatsapp"],
                             }
                             valid_posts.append(replacement)
                             print(f"  [Retry] [{sheet_name}] Using row {ri} instead")
@@ -459,6 +507,7 @@ def main():
     # ── Launch browser once ──
     print("\n[3/6] Launching WhatsApp Web...")
     driver = get_driver()
+    sent_count = 0
 
     try:
         wait_for_whatsapp_load(driver)
@@ -466,30 +515,53 @@ def main():
         # ── Post each status ──
         for i, post in enumerate(posts_to_send, 1):
             print(f"\n[4/6] Posting status {i}/{len(posts_to_send)} [{post['sheet_name']}]...")
-            post_status(driver, post["image_path"], post["caption"])
+
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    post_status(driver, post["image_path"], post["caption"])
+                    break
+                except Exception as e:
+                    is_session_dead = "invalid session id" in str(e).lower() or \
+                                      "session deleted" in str(e).lower() or \
+                                      "not connected to DevTools" in str(e).lower()
+                    if is_session_dead and attempt < max_retries - 1:
+                        print(f"  [Recovery] Browser session lost. Relaunching... (attempt {attempt + 2})")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        time.sleep(3)
+                        driver = get_driver()
+                        wait_for_whatsapp_load(driver)
+                    else:
+                        raise
+
+            # Mark as sent immediately after each successful post
+            mark_as_sent(post["worksheet"], post["row_number"], post.get("col_whatsapp", COL_WHATSAPP))
+            print(f"  [{post['sheet_name']}] Row {post['row_number']} marked as sent ✓")
+            sent_count += 1
 
             # Wait between posts to avoid issues
             if i < len(posts_to_send):
                 print("  Waiting 5 seconds before next post...")
                 time.sleep(5)
 
-        # ── Mark all as sent ──
-        print(f"\n[5/6] Updating Google Sheets...")
-        for post in posts_to_send:
-            mark_as_sent(post["worksheet"], post["row_number"])
-            print(f"  [{post['sheet_name']}] Row {post['row_number']} ✓")
-
         print("\n" + "=" * 56)
-        print(f"  Done! {len(posts_to_send)} status(es) posted and sheets updated.")
+        print(f"  Done! {sent_count}/{len(posts_to_send)} status(es) posted and sheets updated.")
         print("=" * 56)
 
     except Exception as e:
         print(f"\n  ERROR: {e}")
-        print("  Some posts may not have been sent. Check sheets manually.")
+        print(f"  {sent_count} post(s) were sent and marked before the error.")
+        print("  Remaining posts were NOT sent. Re-run the script to retry.")
         raise
     finally:
         time.sleep(2)
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     # Clean up temp dir
     import shutil
